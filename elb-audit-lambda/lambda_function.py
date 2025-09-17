@@ -260,8 +260,9 @@ def is_public(elb: Dict) -> bool:
 
 def is_insecure_listener(listener: Dict) -> bool:
     """Check if listener uses insecure protocol."""
-    protocol = listener.get('Protocol', '').upper()
-    port = listener.get('Port', 0)
+    # Handle both ALB/NLB format and Classic ELB format
+    protocol = listener.get('Protocol', listener.get('protocol', '')).upper()
+    port = listener.get('Port', listener.get('load_balancer_port', 0))
     
     # HTTP listeners are generally insecure
     if protocol == 'HTTP':
@@ -291,13 +292,13 @@ def analyze_classic_elb_security(elb: Dict, listeners: List[Dict], region: str) 
     
     for listener in listeners:
         if is_insecure_listener(listener):
-            protocol = listener.get('Protocol', 'Unknown')
-            port = listener.get('Port', 'Unknown')
+            protocol = listener.get('protocol', 'Unknown')
+            port = listener.get('load_balancer_port', 'Unknown')
             insecure_listeners.append(f"{protocol} on port {port}")
             severity = 'warning'
         
         # Collect HTTPS listeners for SSL analysis
-        if listener.get('Protocol', '').upper() == 'HTTPS':
+        if listener.get('protocol', '').upper() == 'HTTPS':
             https_listeners.append(listener)
     
     if insecure_listeners:
@@ -469,16 +470,28 @@ def audit_load_balancers_in_region(region: str, scan_all_regions_flag: bool) -> 
                 lb_name = elb.get('LoadBalancerName', 'Unknown')
                 listeners = elb.get('ListenerDescriptions', [])
                 
-                # Extract listener info
+                # Extract detailed listener info
                 listener_details = []
                 for listener_desc in listeners:
                     listener = listener_desc.get('Listener', {})
-                    listener_details.append({
-                        'Protocol': listener.get('Protocol'),
-                        'LoadBalancerPort': listener.get('LoadBalancerPort'),
-                        'InstancePort': listener.get('InstancePort'),
-                        'InstanceProtocol': listener.get('InstanceProtocol')
-                    })
+                    listener_info = {
+                        'protocol': listener.get('Protocol'),
+                        'load_balancer_port': listener.get('LoadBalancerPort'),
+                        'instance_port': listener.get('InstancePort'),
+                        'instance_protocol': listener.get('InstanceProtocol'),
+                        'ssl_certificate_id': listener.get('SSLCertificateId')
+                    }
+                    listener_details.append(listener_info)
+                
+                # Get health check information
+                health_check = elb.get('HealthCheck', {})
+                health_check_info = {
+                    'target': health_check.get('Target'),
+                    'interval': health_check.get('Interval'),
+                    'timeout': health_check.get('Timeout'),
+                    'healthy_threshold': health_check.get('HealthyThreshold'),
+                    'unhealthy_threshold': health_check.get('UnhealthyThreshold')
+                }
                 
                 # Security analysis
                 security_analysis = analyze_classic_elb_security(elb, listener_details, region)
@@ -488,7 +501,18 @@ def audit_load_balancers_in_region(region: str, scan_all_regions_flag: bool) -> 
                     'type': 'classic',
                     'scheme': elb.get('Scheme', 'Unknown'),
                     'dns_name': elb.get('DNSName', 'Unknown'),
+                    'canonical_hosted_zone_name': elb.get('CanonicalHostedZoneName', 'Unknown'),
+                    'canonical_hosted_zone_name_id': elb.get('CanonicalHostedZoneNameID', 'Unknown'),
+                    'created_time': elb.get('CreatedTime').isoformat() if elb.get('CreatedTime') else None,
+                    'vpc_id': elb.get('VPCId'),
+                    'subnets': elb.get('Subnets', []),
+                    'availability_zones': elb.get('AvailabilityZones', []),
+                    'security_groups': elb.get('SecurityGroups', []),
+                    'source_security_group': elb.get('SourceSecurityGroup', {}),
+                    'instances': [inst.get('InstanceId') for inst in elb.get('Instances', [])],
+                    'health_check': health_check_info,
                     'listeners': listener_details,
+                    'listener_count': len(listeners),
                     'security_analysis': security_analysis
                 }
                 
@@ -525,13 +549,33 @@ def audit_load_balancers_in_region(region: str, scan_all_regions_flag: bool) -> 
                 # Security analysis
                 security_analysis = analyze_alb_nlb_security(lb, listeners, elbv2_client, region)
                 
+                # Extract detailed listener information
+                listener_details = []
+                for listener in listeners:
+                    listener_info = {
+                        'protocol': listener.get('Protocol', 'Unknown'),
+                        'port': listener.get('Port', 0),
+                        'ssl_policy': listener.get('SslPolicy'),
+                        'certificates': [cert.get('CertificateArn') for cert in listener.get('Certificates', [])],
+                        'default_actions': listener.get('DefaultActions', [])
+                    }
+                    listener_details.append(listener_info)
+
                 lb_info = {
                     'name': lb_name,
+                    'arn': lb_arn,
                     'type': lb.get('Type', 'Unknown'),
                     'scheme': lb.get('Scheme', 'Unknown'),
                     'dns_name': lb.get('DNSName', 'Unknown'),
+                    'canonical_hosted_zone_id': lb.get('CanonicalHostedZoneId', 'Unknown'),
+                    'created_time': lb.get('CreatedTime').isoformat() if lb.get('CreatedTime') else None,
                     'state': lb.get('State', {}).get('Code', 'Unknown'),
-                    'listeners': len(listeners),
+                    'vpc_id': lb.get('VpcId', 'Unknown'),
+                    'availability_zones': [az.get('ZoneName') for az in lb.get('AvailabilityZones', [])],
+                    'security_groups': lb.get('SecurityGroups', []),
+                    'ip_address_type': lb.get('IpAddressType', 'Unknown'),
+                    'listeners': listener_details,
+                    'listener_count': len(listeners),
                     'security_analysis': security_analysis
                 }
                 
@@ -863,6 +907,57 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
         if summary_stats['total_load_balancers'] == 0:
             logger.info("No load balancers found in scanned regions")
         
+        # Extract detailed findings for easy consumption
+        detailed_findings = {
+            'public_load_balancers': [],
+            'insecure_load_balancers': [],
+            'critical_ssl_issues': [],
+            'all_load_balancers': []
+        }
+        
+        for region_result in results:
+            # Process Classic ELBs
+            for elb in region_result.get('classic_elbs', []):
+                lb_summary = {
+                    'name': elb['name'],
+                    'type': 'Classic ELB',
+                    'region': region_result['region'],
+                    'dns_name': elb['dns_name'],
+                    'scheme': elb['scheme'],
+                    'is_public': elb['security_analysis']['is_public'],
+                    'insecure_listeners': elb['security_analysis']['insecure_listeners'],
+                    'severity': elb['security_analysis']['severity']
+                }
+                detailed_findings['all_load_balancers'].append(lb_summary)
+                
+                if lb_summary['is_public']:
+                    detailed_findings['public_load_balancers'].append(lb_summary)
+                if lb_summary['insecure_listeners'] > 0:
+                    detailed_findings['insecure_load_balancers'].append(lb_summary)
+                if lb_summary['severity'] == 'critical':
+                    detailed_findings['critical_ssl_issues'].append(lb_summary)
+            
+            # Process ALBs/NLBs
+            for lb in region_result.get('alb_nlbs', []):
+                lb_summary = {
+                    'name': lb['name'],
+                    'type': lb['type'],
+                    'region': region_result['region'],
+                    'dns_name': lb['dns_name'],
+                    'scheme': lb['scheme'],
+                    'is_public': lb['security_analysis']['is_public'],
+                    'insecure_listeners': lb['security_analysis']['insecure_listeners'],
+                    'severity': lb['security_analysis']['severity']
+                }
+                detailed_findings['all_load_balancers'].append(lb_summary)
+                
+                if lb_summary['is_public']:
+                    detailed_findings['public_load_balancers'].append(lb_summary)
+                if lb_summary['insecure_listeners'] > 0:
+                    detailed_findings['insecure_load_balancers'].append(lb_summary)
+                if lb_summary['severity'] == 'critical':
+                    detailed_findings['critical_ssl_issues'].append(lb_summary)
+
         return {
             'statusCode': status_code,
             'body': {
@@ -870,11 +965,13 @@ def lambda_handler(event: Dict[str, Any], context) -> Dict[str, Any]:
                 'results': {
                     'region_results': results,
                     'summary': summary_stats,
+                    'detailed_findings': detailed_findings,
                     'audit_parameters': {
                         'scan_all_regions': scan_all_regions_flag,
                         'max_workers': max_workers,
                         'account_id': account_id,
-                        'caller_arn': caller_arn
+                        'caller_arn': caller_arn,
+                        'timestamp': datetime.now().isoformat()
                     }
                 },
                 'executionId': context.aws_request_id,

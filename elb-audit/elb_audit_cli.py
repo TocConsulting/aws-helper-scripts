@@ -354,8 +354,8 @@ def audit_region_parallel(region: str, session=None) -> dict:
         
         region_results = {
             'region': region,
-            'classic_elbs': 0,
-            'alb_nlbs': 0,
+            'classic_elbs': [],
+            'alb_nlbs': [],
             'public_elbs': 0,
             'insecure_listeners': 0,
             'errors': []
@@ -365,10 +365,18 @@ def audit_region_parallel(region: str, session=None) -> dict:
         try:
             classic_response = elb_client.describe_load_balancers()
             classic_elbs = classic_response.get('LoadBalancerDescriptions', [])
-            region_results['classic_elbs'] = len(classic_elbs)
             
             for elb in classic_elbs:
-                if is_public(elb):
+                elb_info = {
+                    'name': elb['LoadBalancerName'],
+                    'scheme': elb['Scheme'],
+                    'dns_name': elb.get('DNSName', 'Unknown'),
+                    'listeners': [],
+                    'is_public': is_public(elb),
+                    'insecure_listeners': []
+                }
+                
+                if elb_info['is_public']:
                     region_results['public_elbs'] += 1
                 
                 # Check for insecure listeners
@@ -376,9 +384,23 @@ def audit_region_parallel(region: str, session=None) -> dict:
                     listener = listener_desc.get('Listener', {})
                     protocol = listener.get('Protocol', '').upper()
                     port = listener.get('LoadBalancerPort', 0)
+                    instance_port = listener.get('InstancePort', 0)
+                    
+                    listener_info = {
+                        'protocol': protocol,
+                        'port': port,
+                        'instance_port': instance_port,
+                        'insecure': False
+                    }
                     
                     if protocol == 'HTTP' or (port in [80, 8080, 8000, 3000] and protocol != 'HTTPS'):
                         region_results['insecure_listeners'] += 1
+                        listener_info['insecure'] = True
+                        elb_info['insecure_listeners'].append(f"{protocol}:{port}")
+                    
+                    elb_info['listeners'].append(listener_info)
+                
+                region_results['classic_elbs'].append(elb_info)
                         
         except ClientError as e:
             if e.response['Error']['Code'] not in ['UnauthorizedOperation', 'AccessDenied']:
@@ -388,10 +410,20 @@ def audit_region_parallel(region: str, session=None) -> dict:
         try:
             alb_response = elbv2_client.describe_load_balancers()
             alb_nlbs = alb_response.get('LoadBalancers', [])
-            region_results['alb_nlbs'] = len(alb_nlbs)
             
             for lb in alb_nlbs:
-                if is_public(lb):
+                lb_info = {
+                    'name': lb['LoadBalancerName'],
+                    'type': lb['Type'],
+                    'scheme': lb['Scheme'],
+                    'dns_name': lb.get('DNSName', 'Unknown'),
+                    'state': lb.get('State', {}).get('Code', 'Unknown'),
+                    'listeners': [],
+                    'is_public': is_public(lb),
+                    'insecure_listeners': []
+                }
+                
+                if lb_info['is_public']:
                     region_results['public_elbs'] += 1
                 
                 # Get listeners and check for insecure ones
@@ -403,17 +435,29 @@ def audit_region_parallel(region: str, session=None) -> dict:
                         protocol = listener.get('Protocol', '').upper()
                         port = listener.get('Port', 0)
                         
+                        listener_info = {
+                            'protocol': protocol,
+                            'port': port,
+                            'insecure': False
+                        }
+                        
                         if protocol == 'HTTP' or (port in [80, 8080, 8000, 3000] and protocol != 'HTTPS'):
                             region_results['insecure_listeners'] += 1
+                            listener_info['insecure'] = True
+                            lb_info['insecure_listeners'].append(f"{protocol}:{port}")
+                        
+                        lb_info['listeners'].append(listener_info)
                             
                 except ClientError:
                     pass  # Skip individual listener errors
+                
+                region_results['alb_nlbs'].append(lb_info)
                     
         except ClientError as e:
             if e.response['Error']['Code'] not in ['UnauthorizedOperation', 'AccessDenied']:
                 region_results['errors'].append(f"ALB/NLB error: {e.response['Error']['Message']}")
         
-        total_lbs = region_results['classic_elbs'] + region_results['alb_nlbs']
+        total_lbs = len(region_results['classic_elbs']) + len(region_results['alb_nlbs'])
         
         with print_lock:
             if total_lbs > 0:
@@ -433,8 +477,8 @@ def audit_region_parallel(region: str, session=None) -> dict:
             print(f"  ❌ {error_msg}")
         return {
             'region': region,
-            'classic_elbs': 0,
-            'alb_nlbs': 0,
+            'classic_elbs': [],
+            'alb_nlbs': [],
             'public_elbs': 0,
             'insecure_listeners': 0,
             'errors': [error_msg]
@@ -468,6 +512,92 @@ def audit_regions_parallel(regions: list, max_workers: int = 5, session=None) ->
                 })
         
         return all_results
+
+def display_detailed_findings(results: list):
+    """Display detailed findings from parallel audit results."""
+    print("\n" + "="*60)
+    print("DETAILED FINDINGS")
+    print("="*60)
+    
+    for region_result in results:
+        region = region_result['region']
+        classic_elbs = region_result.get('classic_elbs', [])
+        alb_nlbs = region_result.get('alb_nlbs', [])
+        
+        if not classic_elbs and not alb_nlbs:
+            continue
+            
+        print_header(f"Load Balancers in {region}")
+        
+        # Display Classic ELBs
+        if classic_elbs:
+            print(f"\nClassic ELBs ({len(classic_elbs)} found):")
+            for elb in classic_elbs:
+                name = elb['name']
+                scheme = elb['scheme']
+                dns_name = elb['dns_name']
+                
+                scheme_color = Colors.GREEN if scheme != 'internet-facing' else Colors.RED
+                scheme_text = color_text(scheme, scheme_color)
+                
+                print(f"\n  Load Balancer: {name} ({scheme_text})")
+                print(f"  DNS Name: {dns_name}")
+                print("  Listeners:")
+                
+                insecure_found = False
+                for listener in elb['listeners']:
+                    proto = listener['protocol']
+                    port = listener['port']
+                    instance_port = listener['instance_port']
+                    line = f"   - {proto} {port} -> instance {instance_port}"
+                    
+                    if listener['insecure']:
+                        line = color_text(line + " ⚠️ Insecure", Colors.YELLOW)
+                        insecure_found = True
+                    print(line)
+                
+                if elb['is_public']:
+                    print(color_text("  ⚠️ Publicly accessible ELB detected!", Colors.RED))
+                if elb['insecure_listeners']:
+                    print(color_text(f"  🚨 Insecure listeners: {', '.join(elb['insecure_listeners'])}", Colors.YELLOW))
+                if not insecure_found and not elb['is_public']:
+                    print(color_text("  ✅ No security issues detected on this ELB.", Colors.GREEN))
+        
+        # Display ALBs/NLBs
+        if alb_nlbs:
+            print(f"\nApplication/Network Load Balancers ({len(alb_nlbs)} found):")
+            for lb in alb_nlbs:
+                name = lb['name']
+                lb_type = lb['type']
+                scheme = lb['scheme']
+                dns_name = lb['dns_name']
+                state = lb['state']
+                
+                scheme_color = Colors.GREEN if scheme != 'internet-facing' else Colors.RED
+                scheme_text = color_text(scheme, scheme_color)
+                
+                print(f"\n  Load Balancer: {name} (Type: {lb_type}, Scheme: {scheme_text})")
+                print(f"  DNS Name: {dns_name}")
+                print(f"  State: {state}")
+                print("  Listeners:")
+                
+                insecure_found = False
+                for listener in lb['listeners']:
+                    proto = listener['protocol']
+                    port = listener['port']
+                    line = f"   - {proto} port {port}"
+                    
+                    if listener['insecure']:
+                        line = color_text(line + " ⚠️ Insecure", Colors.YELLOW)
+                        insecure_found = True
+                    print(line)
+                
+                if lb['is_public']:
+                    print(color_text("  ⚠️ Publicly accessible ALB/NLB detected!", Colors.RED))
+                if lb['insecure_listeners']:
+                    print(color_text(f"  🚨 Insecure listeners: {', '.join(lb['insecure_listeners'])}", Colors.YELLOW))
+                if not insecure_found and not lb['is_public']:
+                    print(color_text("  ✅ No security issues detected on this ALB/NLB.", Colors.GREEN))
 
 def send_sns_alert(summary_stats: dict, sns_topic_arn: str, account_id: str = "Unknown", session=None):
     """Send SNS alert for load balancer security findings."""
@@ -746,7 +876,7 @@ SECURITY CHECKS:
             
             # Calculate summary statistics
             summary_stats = {
-                'total_load_balancers': sum(r['classic_elbs'] + r['alb_nlbs'] for r in results),
+                'total_load_balancers': sum(len(r['classic_elbs']) + len(r['alb_nlbs']) for r in results),
                 'total_public_elbs': sum(r['public_elbs'] for r in results),
                 'total_insecure_listeners': sum(r['insecure_listeners'] for r in results),
                 'regions_processed': len(results),
@@ -761,6 +891,9 @@ SECURITY CHECKS:
             print(f"   Insecure listeners: {summary_stats['total_insecure_listeners']}")
             if summary_stats['regions_with_errors'] > 0:
                 print(f"   Regions with errors: {summary_stats['regions_with_errors']}")
+            
+            # Display detailed findings
+            display_detailed_findings(results)
             
             # Send SNS alert if configured and findings exist
             if args.sns_topic and (summary_stats['total_public_elbs'] > 0 or summary_stats['total_insecure_listeners'] > 0):
