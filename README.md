@@ -93,7 +93,7 @@ This creates two SNS topics:
 
 ```bash
 # Clone the repository
-git clone https://github.com/CloudinitFrance/aws-helper-scripts.git
+git clone https://github.com/TocConsulting/aws-helper-scripts.git
 cd aws-helper-scripts
 
 # Run any CLI script
