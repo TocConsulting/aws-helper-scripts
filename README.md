@@ -1,6 +1,12 @@
-# 🛠️ AWS Helper Scripts Collection
+<p align="center">
+  <img src="assets/aws-helper-scripts-logo.png" alt="AWS Helper Scripts" width="600">
+</p>
 
-A comprehensive collection of AWS DevOps and security scripts designed to streamline cloud operations, enhance security posture, and automate common tasks across AWS environments.
+<h1 align="center">AWS Helper Scripts Collection</h1>
+
+<p align="center">
+  A comprehensive collection of AWS DevOps and security scripts designed to streamline cloud operations, enhance security posture, and automate common tasks across AWS environments.
+</p>
 
 ## 🌟 Features
 
