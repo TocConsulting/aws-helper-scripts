@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/aws-helper-scripts-logo.png" alt="AWS Helper Scripts" width="600">
+  <img src="assets/aws-helper-scripts-logo.png" alt="AWS Helper Scripts" style="max-width: 100%; height: auto;">
 </p>
 
 <h1 align="center">AWS Helper Scripts Collection</h1>
